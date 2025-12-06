@@ -3,12 +3,16 @@ import json
 import csv
 import sys
 import shutil
+import time
+import os
+import asyncio
+from typing import List, Dict, Any
 
 def check_op_installed():
     """Checks if the 'op' CLI is installed."""
     if not shutil.which("op"):
-        print("Error: 'op' CLI is not installed or not in PATH.")
-        print("Please install the 1Password CLI: https://developer.1password.com/docs/cli/get-started/")
+        print("❌ Error: 'op' CLI is not installed or not in PATH.")
+        print("   Please install the 1Password CLI: https://developer.1password.com/docs/cli/get-started/")
         sys.exit(1)
 
 def check_op_signin():
@@ -17,128 +21,205 @@ def check_op_signin():
         # 'op whoami' returns 0 if signed in, non-zero otherwise
         subprocess.run(["op", "whoami"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except subprocess.CalledProcessError:
-        print("Error: You are not signed in to 1Password CLI.")
-        print("Please run 'op signin' first.")
+        print("❌ Error: You are not signed in to 1Password CLI.")
+        print("   Please run 'op signin' first.")
         sys.exit(1)
 
-def get_vaults():
-    """Fetches a list of all vaults."""
+async def run_subprocess(cmd: List[str], capture_output: bool = True, text: bool = True, check: bool = True) -> subprocess.CompletedProcess:
+    """Async wrapper for subprocess.run."""
+    process = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE if capture_output else None,
+        stderr=asyncio.subprocess.PIPE if capture_output else None
+    )
+    stdout, stderr = await process.communicate()
+    return subprocess.CompletedProcess(cmd, process.returncode, stdout.decode() if text and stdout else stdout,
+                                       stderr.decode() if text and stderr else stderr)
+
+async def get_vaults() -> List[Dict[str, Any]]:
+    """Fetches a list of all vaults the user can manage."""
     try:
-        result = subprocess.run(["op", "vault", "list", "--format=json"], capture_output=True, text=True, check=True)
+        result = await run_subprocess(["op", "vault", "list", "--permission", "manage_vault", "--format=json"])
+        result.check_returncode()
         return json.loads(result.stdout)
-    except subprocess.CalledProcessError as e:
-        print(f"Error fetching vaults: {e.stderr}")
+    except (subprocess.CalledProcessError, json.JSONDecodeError) as e:
+        print(f"❌ Error fetching vaults: {e}")
         sys.exit(1)
 
-def get_vault_users(vault_id):
+async def get_all_groups() -> List[Dict[str, Any]]:
+    """Fetches a list of all groups."""
+    try:
+        result = await run_subprocess(["op", "group", "list", "--format=json"])
+        result.check_returncode()
+        return json.loads(result.stdout)
+    except (subprocess.CalledProcessError, json.JSONDecodeError) as e:
+        print(f"❌ Error fetching groups: {e}")
+        sys.exit(1)
+
+async def get_vault_users(vault_id: str) -> List[Dict[str, Any]]:
     """Fetches users with access to a specific vault."""
     try:
-        result = subprocess.run(["op", "vault", "user", "list", vault_id, "--format=json"], capture_output=True, text=True, check=True)
+        result = await run_subprocess(["op", "vault", "user", "list", vault_id, "--format=json"])
+        result.check_returncode()
         return json.loads(result.stdout)
-    except subprocess.CalledProcessError as e:
+    except (subprocess.CalledProcessError, json.JSONDecodeError):
         # Some vaults might not allow listing users or might be empty/special
-        print(f"Warning: Could not fetch users for vault ID {vault_id}: {e.stderr.strip()}")
         return []
 
-def get_vault_groups(vault_id):
+async def get_vault_groups(vault_id: str) -> List[Dict[str, Any]]:
     """Fetches groups with access to a specific vault."""
     try:
-        result = subprocess.run(["op", "vault", "group", "list", vault_id, "--format=json"], capture_output=True, text=True, check=True)
+        result = await run_subprocess(["op", "vault", "group", "list", vault_id, "--format=json"])
+        result.check_returncode()
         return json.loads(result.stdout)
-    except subprocess.CalledProcessError as e:
-        print(f"Warning: Could not fetch groups for vault ID {vault_id}: {e.stderr.strip()}")
+    except (subprocess.CalledProcessError, json.JSONDecodeError):
         return []
 
-def get_group_members(group_id):
+async def get_group_members(group_id: str) -> List[Dict[str, Any]]:
     """Fetches members of a specific group."""
     try:
-        result = subprocess.run(["op", "group", "user", "list", group_id, "--format=json"], capture_output=True, text=True, check=True)
+        result = await run_subprocess(["op", "group", "user", "list", group_id, "--format=json"])
+        result.check_returncode()
         return json.loads(result.stdout)
-    except subprocess.CalledProcessError as e:
-        print(f"Warning: Could not fetch members for group ID {group_id}: {e.stderr.strip()}")
+    except (subprocess.CalledProcessError, json.JSONDecodeError):
         return []
 
-def main():
-    print("Checking 1Password CLI status...")
-    check_op_installed()
-    check_op_signin()
+async def fetch_group_members(group_id: str) -> tuple[str, List[Dict[str, Any]]]:
+    """Wrapper for fetching group members."""
+    members = await get_group_members(group_id)
+    return group_id, members
 
-    print("Fetching vaults...")
-    vaults = get_vaults()
+async def print_progress(current: int, total: int, prefix: str = "Progress", icon: str = "⚡"):
+    """Simple progress bar."""
+    if total == 0:
+        return
+    percent = (current / total) * 100
+    bar_length = 20
+    filled_length = int(bar_length * current // total)
+    bar = '█' * filled_length + '-' * (bar_length - filled_length)
+    print(f'\r{icon} {prefix}: |{bar}| {current}/{total} ({percent:.0f}%)', end='', flush=True)
+    if current == total:
+        print()
 
-    report_data = []
+async def process_vault(vault: Dict[str, Any], group_members_cache: Dict[str, List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+    """Processes a single vault, fetching direct users and group-based access."""
+    vault_name = vault.get("name", "Unknown Vault")
+    vault_id = vault.get("id")
 
-    print(f"Found {len(vaults)} vaults. Scanning permissions...")
+    if not vault_id:
+        return []
 
-    for vault in vaults:
-        vault_name = vault.get("name", "Unknown Vault")
-        vault_id = vault.get("id")
+    # Dictionary to track user access for this vault
+    # Key: user_id, Value: {name, email, permissions, access_via (set)}
+    vault_access: Dict[str, Dict[str, Any]] = {}
 
-        if not vault_id:
-            continue
+    # 1. Get Direct Access
+    direct_users = await get_vault_users(vault_id)
+    for user in direct_users:
+        user_id = user.get("id")
+        if not user_id: continue
 
-        # Dictionary to track user access for this vault
-        # Key: user_id, Value: {name, email, permissions, access_via (set)}
-        vault_access = {}
+        if user_id not in vault_access:
+            vault_access[user_id] = {
+                "name": user.get("name", "Unknown User"),
+                "email": user.get("email", "No Email"),
+                "permissions": set(user.get("permissions", [])),
+                "access_via": set(["Direct"])
+            }
+        else:
+            vault_access[user_id]["access_via"].add("Direct")
+            vault_access[user_id]["permissions"].update(user.get("permissions", []))
 
-        # 1. Get Direct Access
-        direct_users = get_vault_users(vault_id)
-        for user in direct_users:
-            user_id = user.get("id")
+    # 2. Get Group Access (using cached members)
+    groups = await get_vault_groups(vault_id)
+    for group in groups:
+        group_name = group.get("name", "Unknown Group")
+        group_id = group.get("id")
+        group_permissions = group.get("permissions", [])
+
+        if not group_id: continue
+
+        group_members = group_members_cache.get(group_id, [])
+        for member in group_members:
+            user_id = member.get("id")
             if not user_id: continue
 
             if user_id not in vault_access:
                 vault_access[user_id] = {
-                    "name": user.get("name", "Unknown User"),
-                    "email": user.get("email", "No Email"),
-                    "permissions": set(user.get("permissions", [])),
-                    "access_via": set(["Direct"])
+                    "name": member.get("name", "Unknown User"),
+                    "email": member.get("email", "No Email"),
+                    "permissions": set(group_permissions),
+                    "access_via": set([f"Group: {group_name}"])
                 }
             else:
-                vault_access[user_id]["access_via"].add("Direct")
-                vault_access[user_id]["permissions"].update(user.get("permissions", []))
+                vault_access[user_id]["access_via"].add(f"Group: {group_name}")
+                vault_access[user_id]["permissions"].update(group_permissions)
 
-        # 2. Get Group Access
-        groups = get_vault_groups(vault_id)
-        for group in groups:
-            group_name = group.get("name", "Unknown Group")
-            group_id = group.get("id")
-            group_permissions = group.get("permissions", [])
+    # 3. Flatten for Report
+    local_report = []
+    for user_data in vault_access.values():
+        permissions_str = ", ".join(sorted(list(user_data["permissions"])))
+        access_via_str = ", ".join(sorted(list(user_data["access_via"])))
 
-            if not group_id: continue
+        local_report.append({
+            "User Name": user_data["name"],
+            "User Email": user_data["email"],
+            "Vault Name": vault_name,
+            "Permissions": permissions_str,
+            "Access Via": access_via_str
+        })
 
-            group_members = get_group_members(group_id)
-            for member in group_members:
-                user_id = member.get("id")
-                if not user_id: continue
+    return local_report
 
-                if user_id not in vault_access:
-                    vault_access[user_id] = {
-                        "name": member.get("name", "Unknown User"),
-                        "email": member.get("email", "No Email"),
-                        "permissions": set(group_permissions),
-                        "access_via": set([f"Group: {group_name}"])
-                    }
-                else:
-                    vault_access[user_id]["access_via"].add(f"Group: {group_name}")
-                    vault_access[user_id]["permissions"].update(group_permissions)
+async def main():
+    print("🔍 1Password Access Audit Starting...\n")
+    
+    print("   Stage 1: Verifying CLI setup")
+    check_op_installed()
+    check_op_signin()
+    print("      ✅ CLI ready\n")
 
-        # 3. Flatten for Report
-        for user_data in vault_access.values():
-            permissions_str = ", ".join(sorted(list(user_data["permissions"])))
-            access_via_str = ", ".join(sorted(list(user_data["access_via"])))
+    print("   Stage 2: Fetching vaults")
+    vaults = await get_vaults()
+    print(f"      📂 {len(vaults)} vaults found\n")
 
-            report_data.append({
-                "User Name": user_data["name"],
-                "User Email": user_data["email"],
-                "Vault Name": vault_name,
-                "Permissions": permissions_str,
-                "Access Via": access_via_str
-            })
+    print("   Stage 3: Fetching groups")
+    all_groups = await get_all_groups()
+    relevant_groups = [g for g in all_groups if g.get("id")]
+    total_groups = len(relevant_groups)
+    print(f"      👥 {len(all_groups)} groups total ({total_groups} relevant)\n")
 
+    print("   Stage 4: Loading group members")
+    group_members_cache: Dict[str, List[Dict[str, Any]]] = {}
+    if total_groups > 0:
+        tasks = [fetch_group_members(g["id"]) for g in relevant_groups]
+        completed = 0
+        for coro in asyncio.as_completed(tasks):
+            group_id, members = await coro
+            group_members_cache[group_id] = members
+            completed += 1
+            await print_progress(completed, total_groups, "Loading", "👥")
+        print("      ✅ Groups loaded\n")
+    else:
+        print("      ℹ️  No groups to load\n")
+
+    print("   Stage 5: Auditing vault access")
+    report_data: List[Dict[str, Any]] = []
+    total_vaults = len(vaults)
+    if total_vaults > 0:
+        tasks = [process_vault(vault, group_members_cache) for vault in vaults]
+        completed = 0
+        for coro in asyncio.as_completed(tasks):
+            result = await coro
+            report_data.extend(result)
+            completed += 1
+            await print_progress(completed, total_vaults, "Auditing", "📂")
+        print("      ✅ Audit complete\n")
+    else:
+        print("      ℹ️  No vaults to audit\n")
+
+    print("   Stage 6: Generating report")
     output_file = "1password_access_report.csv"
-    print(f"Generating report: {output_file}")
-
     fieldnames = ["User Name", "User Email", "Vault Name", "Permissions", "Access Via"]
 
     try:
@@ -147,9 +228,13 @@ def main():
             writer.writeheader()
             for row in report_data:
                 writer.writerow(row)
-        print("Done!")
+        full_path = os.path.abspath(output_file)
+        print(f"      📊 Report saved: {full_path} ({len(report_data)} entries)\n")
     except IOError as e:
-        print(f"Error writing to file {output_file}: {e}")
+        print(f"      ❌ Error writing to file {output_file}: {e}\n")
+
+    print("🎉 Audit finished successfully!")
+    print()
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
